@@ -1,10 +1,3 @@
-# streamlit_app.py
-# -------------------------------------------------------------
-# Streamlit app to extract fields from purchase-order PDFs,
-# match product references with an existing Excel file, and add department info.
-# Excel file path: C:\Users\Pcadmin\Desktop\New folder\CPEXCEL.xlsx
-# -------------------------------------------------------------
-
 import io
 import re
 import os
@@ -16,7 +9,7 @@ from openpyxl import load_workbook
 from openpyxl.worksheet.datavalidation import DataValidation
 
 # Default Excel file path
-DEFAULT_EXCEL_PATH = r"C:\Users\Pcadmin\Desktop\New folder\CPEXCEL.xlsx"
+DEFAULT_EXCEL_PATH = r"C:\Users\Pcadmin\Documents\ITL\CP-SO-Tracker\CPEXCEL.xlsx"
 
 # ---------------------- Helpers ----------------------
 
@@ -135,9 +128,10 @@ PO_NUM_PATTERNS = [
     r"\bPO\s*Number\s*\n\s*(\d+)\b",
 ]
 
+# supports thousands separators like 1,259.301
 TOTAL_VALUE_PATTERNS = [
-    r"\bTotal\s*Value\s*[:\-]?\s*(?:USD\s*)?([0-9]+(?:\.[0-9]+)?)\b",
-    r"TOTAL\s+NET\s+VALUE[\s\S]{0,40}?USD\s*([0-9]+(?:\.[0-9]+)?)\b",
+    r"\bTotal\s*Value\s*[:\-]?\s*(?:USD\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)\b",
+    r"TOTAL\s+NET\s+VALUE[\s\S]{0,40}?(?:USD\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)\b",
 ]
 
 NOTIFY_BLOCK_RE = re.compile(
@@ -145,10 +139,10 @@ NOTIFY_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# match "price / units" OR "price   units"
 PRICE_PER_UNIT_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*/\s*([0-9][0-9,]*)\b"
+    r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:/\s*|\s{2,})\s*([0-9][0-9,]*)\b"
 )
-
 
 def extract_po_number(text: str) -> str | None:
     for pat in PO_NUM_PATTERNS:
@@ -162,7 +156,9 @@ def extract_total_value(text: str) -> float | None:
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
             try:
-                return float(m.group(1))
+                val = m.group(1)
+                val = val.replace(",", "").strip()
+                return float(val)
             except ValueError:
                 continue
     return None
@@ -177,14 +173,34 @@ def extract_customer(text: str) -> str | None:
         return customer
     return None
 
+# UPDATED: Prefer any row where units == 1000 (e.g., "15.00  1,000"); fallback to old 4th/last logic.
 def extract_price_per_unit_4th(text: str) -> tuple[float, int] | None:
     matches = list(PRICE_PER_UNIT_RE.finditer(text))
     if not matches:
         return None
+
+    # Prefer a match with units exactly 1000
+    for m in matches:
+        price_str = m.group(1).replace(",", "").strip()
+        units_str = m.group(2).replace(",", "").strip()
+        try:
+            price = float(price_str)
+            units = int(units_str)
+            if units == 1000:
+                return price, units
+        except ValueError:
+            continue
+
+    # Fallback: previous behavior (4th match if available, else last)
     idx = 3 if len(matches) >= 4 else len(matches) - 1
     m = matches[idx]
-    price = float(m.group(1))
-    units = int(m.group(2).replace(",", ""))
+    price_str = m.group(1).replace(",", "").strip()
+    units_str = m.group(2).replace(",", "").strip()
+    try:
+        price = float(price_str)
+        units = int(units_str)
+    except ValueError:
+        return None
     return price, units
 
 def extract_product_references(text: str) -> list[str]:
@@ -221,96 +237,96 @@ def compute_quantity(total_value: float | None, price_units: tuple[float, int] |
 
 def extract_ex_fact_date_from_pdf_bytes(pdf_bytes: bytes) -> str:
     """
-    Extract EX-FACT DATE from PDF bytes using your specific logic:
-    Second table, row 5, column 5 (4 row before last column)
+    Extract EX-FACT DATE from PDF bytes in DD/MM/YYYY format:
+    Look for the 'EX-FACT DATE' column in tables and find dates in DD/MM/YYYY format.
+    Specifically avoids reading the Purchase Order date from the header.
     """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            # First try table extraction
             for page in pdf.pages:
                 try:
                     tables = page.extract_tables()
-                    if len(tables) >= 2:  # second table exists
-                        table = tables[1]   # second table (index 1)
-                        if len(table) > 4 and len(table[4]) > 4:  # at least 5 rows & 5 columns
-                            date_val = table[4][4]  # 5th row, 5th col (index 4,4)
-                            if date_val and date_val.strip():
-                                return date_val.strip()
-                except Exception as e:
+                    for table in tables:
+                        if not table:
+                            continue
+                        
+                        # Find header row containing "EX-FACT"
+                        header_row_idx = None
+                        ex_fact_col_idx = None
+                        
+                        for i, row in enumerate(table):
+                            if row and any(cell and "EX-FACT" in str(cell).upper() for cell in row):
+                                header_row_idx = i
+                                # Find the exact column index for EX-FACT DATE
+                                for j, cell in enumerate(row):
+                                    if cell and "EX-FACT" in str(cell).upper():
+                                        ex_fact_col_idx = j
+                                        break
+                                break
+                        
+                        if header_row_idx is not None and ex_fact_col_idx is not None:
+                            # Look through rows below header for DD/MM/YYYY format dates
+                            for row_idx in range(header_row_idx + 1, len(table)):
+                                if row_idx < len(table) and ex_fact_col_idx < len(table[row_idx]):
+                                    cell_value = table[row_idx][ex_fact_col_idx]
+                                    if cell_value and isinstance(cell_value, str):
+                                        # Check for DD/MM/YYYY format (like 04.08.2025 or 04/08/2025)
+                                        date_match = re.search(r'\b(\d{2}[./]\d{2}[./]\d{4})\b', cell_value.strip())
+                                        if date_match:
+                                            return date_match.group(1)
+                except Exception:
                     continue
-                    
-            # If table extraction fails, try text extraction
+            
+            # Fallback to text extraction if table extraction fails
             for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    return extract_ex_fact_date_from_text(text)
+                try:
+                    text = page.extract_text()
+                    if text:
+                        # Look for EX-FACT DATE pattern followed by DD/MM/YYYY
+                        lines = text.split('\n')
+                        po_date_found = None
+                        
+                        # First identify the PO date to avoid it
+                        for line in lines[:10]:  # Check first 10 lines for PO date
+                            if any(keyword in line.upper() for keyword in ['PO NUMBER', 'PURCHASE ORDER', 'DATE']):
+                                po_date_match = re.search(r'\b(\d{2}[./]\d{2}[./]\d{4})\b', line)
+                                if po_date_match:
+                                    po_date_found = po_date_match.group(1)
+                                    break
+                        
+                        # Now look for EX-FACT DATE, avoiding the PO date
+                        for i, line in enumerate(lines):
+                            if 'EX-FACT' in line.upper() and 'DATE' in line.upper():
+                                # Check this line and next few lines for date pattern
+                                for j in range(i, min(i + 15, len(lines))):
+                                    date_matches = re.findall(r'\b(\d{2}[./]\d{2}[./]\d{4})\b', lines[j])
+                                    for date_match in date_matches:
+                                        # Skip if this is the PO date
+                                        if po_date_found and date_match == po_date_found:
+                                            continue
+                                        return date_match
+                        
+                        # As last resort, find dates that are NOT in the header section
+                        # Skip first 15 lines to avoid header dates
+                        lower_text = '\n'.join(lines[15:])
+                        date_matches = re.findall(r'\b(\d{2}[./]\d{2}[./]\d{4})\b', lower_text)
+                        if date_matches:
+                            # Return the first date found in the body (not header)
+                            return date_matches[0]
+                        
+                except Exception:
+                    continue
                     
     except Exception as e:
         return f"Error processing PDF: {str(e)}"
     
     return "date not found"
 
-def extract_ex_fact_date_from_text(document_text: str) -> str:
-    """
-    Extract EX-FACT DATE from text using the specified logic:
-    Read from second long square (table), 4 row before last column (EX-FACT DATE column)
-    """
-    import re
-    
-    # Split document into lines to find table structure
-    lines = document_text.split('\n')
-    
-    # Find the start of the main item table (after the header table)
-    table_start = -1
-    for i, line in enumerate(lines):
-        if 'SALES ORDER/ LINE ITEM CODE' in line and 'EX-FACT' in line:
-            table_start = i
-            break
-    
-    if table_start == -1:
-        # Fallback: look for any line with size codes and dates
-        for line in lines:
-            if any(size in line for size in ['L-R', 'M-R', 'S-R', 'XL-R', 'XS-R']) and 'PC' in line and 'Truck' in line:
-                date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', line)
-                if date_match:
-                    return date_match.group(1)
-        return "table not found"
-    
-    # Look for data lines that contain size information and dates
-    # These represent the "second long square" (main items table)
-    data_lines = []
-    for i in range(table_start + 1, len(lines)):
-        line = lines[i].strip()
-        if line and any(size in line for size in ['L-R', 'M-R', 'S-R', 'XL-R', 'XS-R', 'XXL-R', 'L-S', 'M-S', 'S-S', 'XL-S', 'XS-S', 'M-L', 'S-L', 'XL-L', 'XS-L']):
-            # Check if line contains date pattern (DD.MM.YYYY)
-            if re.search(r'\d{2}\.\d{2}\.\d{4}', line):
-                data_lines.append(line)
-    
-    if not data_lines:
-        return "no data lines found"
-    
-    # Apply your logic: take the 4th row (index 3) from the data lines
-    # This represents "4 row before last column have date"
-    if len(data_lines) >= 4:
-        target_line = data_lines[3]  # 4th row (0-indexed)
-        
-        # Extract date from this line (EX-FACT DATE column)
-        date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', target_line)
-        if date_match:
-            return date_match.group(1)
-    
-    # Fallback: if less than 4 rows, take the first available date
-    if data_lines:
-        first_line = data_lines[0]
-        date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', first_line)
-        if date_match:
-            return date_match.group(1)
-    
-    return "date not found"
-
 # ---------------------- UI ----------------------
 
 st.set_page_config(page_title="PDF → Excel Extractor", layout="wide")
-st.title("📄 PDF → Excel Extractor (PO fields + Department Matching)")
+st.title("📄 PDF → Excel Extractor for CP.")
 
 st.write("Upload PDF files to extract purchase order data and match product references with department database.")
 
@@ -341,10 +357,14 @@ if uploaded:
 
             po_number = extract_po_number(text)
             customer = extract_customer(text)
-            # Fixed: Now using PDF bytes for table extraction and text as fallback
+            # Using PDF bytes for table extraction and text as fallback
             ex_fact_date = extract_ex_fact_date_from_pdf_bytes(raw)
             total_value = extract_total_value(text)
             price_units = extract_price_per_unit_4th(text)
+
+            # Capture price and units for table display
+            ppu_price = price_units[0] if price_units else None
+            ppu_units = price_units[1] if price_units else None
 
             refs_list = extract_product_references(text)
             original_refs = ", ".join(refs_list) if refs_list else None
@@ -360,6 +380,8 @@ if uploaded:
                     "Department": department,
                     "Product Reference": product_ref_display,
                     "Total Value": total_value,
+                    "PRICE/PER UNIT Price": ppu_price,
+                    "PRICE/PER UNIT Units": ppu_units,
                     "Quantity (calculated)": quantity
                 }
             )
@@ -372,8 +394,12 @@ if uploaded:
     
     if rows:
         df = pd.DataFrame(rows)
-        display_columns = ["EX-FACT DATE",  "Customer", "PO Number", 
-                           "Product Reference", "Department",  "Total Value", "Quantity (calculated)"]
+        display_columns = [
+            "EX-FACT DATE", "Customer", "PO Number",
+            "Product Reference", "Department",
+            "Total Value", "PRICE/PER UNIT Price", "PRICE/PER UNIT Units",
+            "Quantity (calculated)"
+        ]
         st.subheader("📋 Extracted Data")
         st.dataframe(df[display_columns], use_container_width=True)
 
