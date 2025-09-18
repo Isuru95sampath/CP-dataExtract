@@ -325,8 +325,8 @@ def extract_ex_fact_date_from_pdf_bytes(pdf_bytes: bytes) -> str:
 
 # ---------------------- UI ----------------------
 
-st.set_page_config(page_title="PDF → Excel Extractor", layout="wide")
-st.title("📄 PDF → Excel Extractor for CP.")
+st.set_page_config(page_title="Unichela data extracter", layout="wide")
+st.title("📄 Unichela data extracter.")
 
 st.write("Upload PDF files to extract purchase order data and match product references with department database.")
 
