@@ -7,11 +7,24 @@ import pdfplumber
 from difflib import SequenceMatcher
 from openpyxl import load_workbook
 from openpyxl.worksheet.datavalidation import DataValidation
+from datetime import datetime  # Added for date conversion
 
 # Default Excel file path
 DEFAULT_EXCEL_PATH = r"C:\Users\Pcadmin\Documents\ITL\CP-SO-Tracker\CPEXCEL.xlsx"
 
 # ---------------------- Helpers ----------------------
+
+def convert_date_format(date_str):
+    """Convert date from dd-mm-yy to mm-dd-yy format"""
+    if not date_str or date_str == "date not found" or date_str.startswith("Error"):
+        return date_str
+    try:
+        # Handle different separators (., /, -)
+        normalized = date_str.replace('.', '/').replace('-', '/')
+        date_obj = datetime.strptime(normalized, "%d/%m/%Y")
+        return date_obj.strftime("%m-%d-%y")
+    except ValueError:
+        return date_str
 
 def read_pdf_text(file_bytes: bytes) -> list[str]:
     texts = []
@@ -92,8 +105,57 @@ def match_product_reference(extracted_refs: str | list[str], reference_mapping: 
         ref_clean = normalize_ref(one_ref)
         if not ref_clean:
             return None
+        
+        # Direct match first
         if ref_clean in clean_map:
             return clean_map[ref_clean]
+        
+        # NEW LOGIC: Special handling for references like "HGT LB 06731-C", "LBL LB 05735-C", "HSL LB 02691-C"
+        # Pattern: 3 letters + space + LB + space + numbers (potentially with leading zeros) + optional suffix
+        special_pattern = re.match(r'^([A-Z]{3})\s*LB\s*0*(\d+)(.*)$', one_ref.upper().strip())
+        if special_pattern:
+            prefix = special_pattern.group(1)  # HGT, LBL, HSL, etc.
+            number = special_pattern.group(2)  # The numeric part without leading zeros
+            suffix = special_pattern.group(3)  # Any suffix like -C
+            
+            # First try: Search with leading zero (original format)
+            # Look for pattern like "02691" in Excel
+            padded_number = number.zfill(5)  # Pad to 5 digits (common format)
+            search_pattern_with_zero = f"0{number}"
+            
+            for ck in keys_clean:
+                # Check if Excel entry contains the padded number or the number with leading zero
+                if padded_number in ck or search_pattern_with_zero in ck:
+                    return clean_map[ck]
+            
+            # Second try: Search without leading zero
+            # Look for pattern like "LB2691C" in Excel (normalized)
+            search_without_zero = normalize_ref(f"LB {number}{suffix}")
+            if search_without_zero in clean_map:
+                return clean_map[search_without_zero]
+            
+            # Third try: Partial matching with the number only
+            for ck in keys_clean:
+                if number in ck and 'LB' in ck:
+                    return clean_map[ck]
+        
+        # Try removing leading zeros in numeric parts (existing logic)
+        tokens = re.split(r'(\d+)', ref_clean)
+        new_tokens = []
+        for token in tokens:
+            if token.isdigit():
+                # Remove leading zeros but keep at least one digit if all zeros
+                new_token = token.lstrip('0')
+                if not new_token:  # if became empty
+                    new_token = '0'
+                new_tokens.append(new_token)
+            else:
+                new_tokens.append(token)
+        variation = ''.join(new_tokens)
+        if variation in clean_map:
+            return clean_map[variation]
+        
+        # Continue with existing strategies
         nums = re.findall(r'\d{4,}', ref_clean)
         if nums:
             for num in nums:
@@ -103,7 +165,6 @@ def match_product_reference(extracted_refs: str | list[str], reference_mapping: 
         for ck in keys_clean:
             if (len(ref_clean) >= 5 and ref_clean in ck) or (len(ck) >= 5 and ck in ref_clean):
                 return clean_map[ck]
-        from difflib import SequenceMatcher
         best_ratio = 0.0
         best_ck = None
         for ck in keys_clean:
@@ -237,7 +298,7 @@ def compute_quantity(total_value: float | None, price_units: tuple[float, int] |
 
 def extract_ex_fact_date_from_pdf_bytes(pdf_bytes: bytes) -> str:
     """
-    Extract EX-FACT DATE from PDF bytes in DD/MM/YYYY format:
+    Extract EX-FACT DATE from PDF bytes in MM-DD-YY format:
     Look for the 'EX-FACT DATE' column in tables and find dates in DD/MM/YYYY format.
     Specifically avoids reading the Purchase Order date from the header.
     """
@@ -274,7 +335,8 @@ def extract_ex_fact_date_from_pdf_bytes(pdf_bytes: bytes) -> str:
                                         # Check for DD/MM/YYYY format (like 04.08.2025 or 04/08/2025)
                                         date_match = re.search(r'\b(\d{2}[./]\d{2}[./]\d{4})\b', cell_value.strip())
                                         if date_match:
-                                            return date_match.group(1)
+                                            # Convert to MM-DD-YY format
+                                            return convert_date_format(date_match.group(1))
                 except Exception:
                     continue
             
@@ -305,7 +367,8 @@ def extract_ex_fact_date_from_pdf_bytes(pdf_bytes: bytes) -> str:
                                         # Skip if this is the PO date
                                         if po_date_found and date_match == po_date_found:
                                             continue
-                                        return date_match
+                                        # Convert to MM-DD-YY format
+                                        return convert_date_format(date_match)
                         
                         # As last resort, find dates that are NOT in the header section
                         # Skip first 15 lines to avoid header dates
@@ -313,7 +376,8 @@ def extract_ex_fact_date_from_pdf_bytes(pdf_bytes: bytes) -> str:
                         date_matches = re.findall(r'\b(\d{2}[./]\d{2}[./]\d{4})\b', lower_text)
                         if date_matches:
                             # Return the first date found in the body (not header)
-                            return date_matches[0]
+                            # Convert to MM-DD-YY format
+                            return convert_date_format(date_matches[0])
                         
                 except Exception:
                     continue
