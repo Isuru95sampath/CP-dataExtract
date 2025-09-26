@@ -134,24 +134,26 @@ def extract_brandix_from_beginning(text):
         return ""
 
 def extract_po_number(text):
-    """Extract PO number (7 digits or alphanumeric) after finding 'PO Number'"""
+    """Extract PO number from different formats"""
     try:
+        # Original pattern
         po_match = re.search(r'PO Number[^\d]*(\d{7})', text, re.IGNORECASE)
         if po_match:
             return po_match.group(1)
         po_match2 = re.search(r'PO Number[^\n:]*[:\s]*([A-Z0-9\-\_]+)', text, re.IGNORECASE)
         if po_match2:
             return po_match2.group(1).strip()
+        # Fallback: PO No. : ...
+        po_match3 = re.search(r'PO\s*No\.?\s*[:\-]?\s*([A-Z0-9]+)', text, re.IGNORECASE)
+        if po_match3:
+            return po_match3.group(1).strip()
         return ""
     except Exception as e:
         st.error(f"Error extracting PO Number: {e}")
         return ""
 
 def extract_po_total_line_from_last_page(pdf):
-    """
-    Read the last page text and return the full line that contains
-    'PO TOTAL AMOUNT :' (verbatim string).
-    """
+    """Try to capture PO Total line from last page"""
     try:
         if not pdf.pages:
             return ""
@@ -162,47 +164,32 @@ def extract_po_total_line_from_last_page(pdf):
         for line in lines:
             if re.search(r'PO\s*TOTAL\s*AMOUNT', line, re.IGNORECASE):
                 return line
+        # Fallback: "PO Total Amount" variant
+        for line in lines:
+            if re.search(r'PO\s*Total\s*Amount', line, re.IGNORECASE):
+                return line
         return ""
     except Exception as e:
         st.error(f"Error extracting PO TOTAL AMOUNT line: {e}")
         return ""
 
 def clean_po_total_line(line):
-    """
-    Clean PO TOTAL AMOUNT line:
-    - Remove 'PO TOTAL AMOUNT :' and 'USD'
-    - Extract last number as PO TOTAL AMOUNT
-    - Other numbers go into Line Amount
-    """
     if not line:
         return "", ""
-
-    # Remove labels
     cleaned = re.sub(r'PO\s*TOTAL\s*AMOUNT\s*:?', '', line, flags=re.IGNORECASE)
     cleaned = cleaned.replace("USD", "").strip()
-
-    # Find all numbers (allow commas, spaces, decimals)
     numbers = re.findall(r'[\d,]+(?:\.\d+)?', cleaned)
-
     if not numbers:
-        return cleaned.strip(), ""  # nothing numeric found
-
-    # Last number = total, rest = line amount
+        return cleaned.strip(), ""
     total = numbers[-1].replace(",", "")
     line_amounts = [n.replace(",", "") for n in numbers[:-1]]
     line_amount = ", ".join(line_amounts) if line_amounts else ""
-
     return total, line_amount
 
 # -------------------- New Product Reference Extraction --------------------
 
 def extract_product_reference_from_item_description(text, reference_mapping):
-    """
-    Extract product reference from the second line of the item description.
-    Look for a 25-digit string and check for similarity with entries in the Excel sheet.
-    """
     try:
-        # Find the "Item Description" section
         lines = text.split('\n')
         item_desc_found = False
         item_desc_lines = []
@@ -211,49 +198,43 @@ def extract_product_reference_from_item_description(text, reference_mapping):
             if "Item Description" in line:
                 item_desc_found = True
                 continue
-            
             if item_desc_found:
-                # Stop if we encounter a header or empty line
                 if (re.search(r'Item number|Quantity|U/M|Purch price|Line Amount|Price UnitLine', line, re.IGNORECASE) or 
                     line.strip() == ""):
                     break
-                
                 item_desc_lines.append(line.strip())
         
-        # If we have at least 2 lines in the item description
         if len(item_desc_lines) >= 2:
             second_line = item_desc_lines[1]
-            
-            # Look for a 25-digit string (alphanumeric) in the second line
-            # We'll look for a 25-character alphanumeric string
             digit_pattern = r'[A-Z0-9]{25}'
             digit_match = re.search(digit_pattern, second_line.upper())
-            
             if digit_match:
-                # Extract the 25-digit string
                 potential_ref = digit_match.group(0)
-                # Check if this reference exists in our mapping
                 matched_ref, department = match_product_reference(potential_ref, reference_mapping)
                 if matched_ref:
                     return matched_ref, department
-            
-            # If no 25-digit string found, try to match the entire second line
             matched_ref, department = match_product_reference(second_line, reference_mapping)
             if matched_ref:
                 return matched_ref, department
-        
+
+        # Fallback: try line starting with No Item ...
+        for line in lines:
+            if re.match(r'^\d+\s+[A-Z0-9\.\-\_]+', line):
+                parts = line.split()
+                if len(parts) > 1:
+                    candidate = parts[1]
+                    matched_ref, department = match_product_reference(candidate, reference_mapping)
+                    if matched_ref:
+                        return matched_ref, department
+
         return None, None
     except Exception as e:
-        st.error(f"Error extracting product reference from item description: {e}")
+        st.error(f"Error extracting product reference: {e}")
         return None, None
 
 # -------------------- Main extraction --------------------
 
 def extract_product_code_and_xmill_date(pdf_file, reference_mapping):
-    """
-    Extract Product Code, X-Mill Date, Brandix, PO Number,
-    and PO TOTAL AMOUNT details from the PO PDF.
-    """
     try:
         pdf_file.seek(0)
         with pdfplumber.open(pdf_file) as pdf:
@@ -269,24 +250,25 @@ def extract_product_code_and_xmill_date(pdf_file, reference_mapping):
             product_code = ""
             department = None
             
-            # Method 1: Try existing TAG.PRC.TKT extraction
+            # Method 1
             tag_match = re.search(r"TAG\.PRC\.TKT_(.*?)_REG", first_text)
             if tag_match:
                 product_code = tag_match.group(1).strip().upper().replace("-", " ")
-                # Try to match this product code to get department
                 matched_ref, department = match_product_reference(product_code, reference_mapping)
                 if matched_ref:
                     product_code = matched_ref
             else:
-                # Method 2: Try extracting from item description
+                # Method 2
                 product_code, department = extract_product_reference_from_item_description(first_text, reference_mapping)
 
+            # X-Mill Date fallback
             x_mill_date = ""
             date_match = re.search(r'X-Mill Date\(dd-mm-yy\)\s*[:\-]?\s*(\d{2}-\d{2}-\d{2})', first_text, re.IGNORECASE)
+            if not date_match:
+                date_match = re.search(r'XMill Date\s*[:\-]?\s*(\d{2}-\d{2}-\d{2})', first_text, re.IGNORECASE)
             if date_match:
                 x_mill_date = convert_date_format(date_match.group(1))
 
-            # Get raw line
             po_total_line = extract_po_total_line_from_last_page(pdf)
             po_total, line_amount = clean_po_total_line(po_total_line)
 
@@ -309,10 +291,8 @@ Upload multiple PO PDF files to extract the Product Code, X-Mill Date, Brandix, 
 the **PO TOTAL AMOUNT**, and any other numbers in the same line (as Line Amount).
 """)
 
-# Default Excel file path for department mapping
 DEFAULT_EXCEL_PATH = r"C:\Users\Pcadmin\Documents\ITL\CP-SO-Tracker\CPEXCEL.xlsx"
 
-# Load department mapping
 reference_mapping = {}
 if 'reference_mapping' not in st.session_state:
     with st.spinner("Loading product reference database..."):
