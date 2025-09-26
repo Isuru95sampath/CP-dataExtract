@@ -52,12 +52,7 @@ def load_product_reference_data(file_path: str) -> dict:
 
 def match_product_reference(extracted_refs, reference_mapping: dict):
     if not extracted_refs or not reference_mapping:
-        if isinstance(extracted_refs, str):
-            return extracted_refs, None
-        elif isinstance(extracted_refs, list) and extracted_refs:
-            return extracted_refs[0], None
-        else:
-            return None, None
+        return None, None
 
     if isinstance(extracted_refs, str):
         refs_list = [r.strip() for r in extracted_refs.split(',') if r.strip()]
@@ -74,7 +69,7 @@ def match_product_reference(extracted_refs, reference_mapping: dict):
     def best_match(one_ref: str):
         ref_clean = normalize_ref(one_ref)
         if not ref_clean:
-            return None
+            return None, None
         if ref_clean in clean_map:
             return clean_map[ref_clean]
         nums = re.findall(r'\d{4,}', ref_clean)
@@ -95,13 +90,13 @@ def match_product_reference(extracted_refs, reference_mapping: dict):
                 best_ck = ck
         if best_ck and best_ratio >= 0.82:
             return clean_map[best_ck]
-        return None
+        return None, None
 
     for ref in refs_list:
         bm = best_match(ref)
-        if bm:
+        if bm and bm[0] is not None:
             return bm
-    return (refs_list[0] if refs_list else None), None
+    return None, None
 
 # -------------------- Original Helpers --------------------
 
@@ -136,17 +131,29 @@ def extract_brandix_from_beginning(text):
 def extract_po_number(text):
     """Extract PO number from different formats"""
     try:
-        # Original pattern
-        po_match = re.search(r'PO Number[^\d]*(\d{7})', text, re.IGNORECASE)
+        # First try: Look for "PO No." followed by 7 digits
+        po_match = re.search(r'PO\s*No\.?\s*[:\-]?\s*(\d{7})', text, re.IGNORECASE)
         if po_match:
             return po_match.group(1)
-        po_match2 = re.search(r'PO Number[^\n:]*[:\s]*([A-Z0-9\-\_]+)', text, re.IGNORECASE)
+            
+        # Second try: Look for "BFF" followed by 7 digits
+        bff_match = re.search(r'BFF\s+(\d{7})', text)
+        if bff_match:
+            return bff_match.group(1)
+            
+        # Third try: Look for "PO Number" followed by 7 digits
+        po_match2 = re.search(r'PO\s*Number[^\d]*(\d{7})', text, re.IGNORECASE)
         if po_match2:
-            return po_match2.group(1).strip()
-        # Fallback: PO No. : ...
-        po_match3 = re.search(r'PO\s*No\.?\s*[:\-]?\s*([A-Z0-9]+)', text, re.IGNORECASE)
-        if po_match3:
-            return po_match3.group(1).strip()
+            return po_match2.group(1)
+            
+        # Fourth try: Look for any 7-digit number after "PO"
+        lines = text.split('\n')
+        for line in lines:
+            if re.search(r'PO', line, re.IGNORECASE):
+                digits = re.findall(r'\d{7}', line)
+                if digits:
+                    return digits[0]
+        
         return ""
     except Exception as e:
         st.error(f"Error extracting PO Number: {e}")
@@ -186,47 +193,73 @@ def clean_po_total_line(line):
     line_amount = ", ".join(line_amounts) if line_amounts else ""
     return total, line_amount
 
-# -------------------- New Product Reference Extraction --------------------
+# -------------------- Updated Product Reference Extraction --------------------
 
-def extract_product_reference_from_item_description(text, reference_mapping):
+def extract_product_reference_from_structured_line(text, reference_mapping):
+    """Extract product reference only from the structured format line"""
     try:
         lines = text.split('\n')
-        item_desc_found = False
-        item_desc_lines = []
         
+        # Look for the header line: "No Item Quantity UM Price Price Unit Line Amount"
+        for i, line in enumerate(lines):
+            if re.search(r'No\s+Item\s+Quantity\s+UM\s+Price', line, re.IGNORECASE):
+                # Look at the next few lines for the actual data
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    data_line = lines[j].strip()
+                    if not data_line:
+                        continue
+                    
+                    # Split the line by spaces to process tokens
+                    tokens = data_line.split()
+                    
+                    # Skip the first token (line number)
+                    if len(tokens) < 2:
+                        continue
+                        
+                    # Collect tokens until we hit a 5-6 digit number (quantity)
+                    product_ref_tokens = []
+                    for token in tokens[1:]:
+                        # Check if token is a 5-6 digit number (quantity)
+                        if re.match(r'^\d{5,6}$', token):
+                            break
+                        product_ref_tokens.append(token)
+                    
+                    # Join the tokens to form the product reference
+                    if product_ref_tokens:
+                        potential_ref = ' '.join(product_ref_tokens)
+                        
+                        # Try to match the entire string (with the number)
+                        result = match_product_reference(potential_ref, reference_mapping)
+                        if result and result[0] is not None:
+                            matched_ref, department = result
+                            return matched_ref, department
+                        
+                        # If that fails, try just the first token (product code)
+                        if product_ref_tokens:
+                            code_part = product_ref_tokens[0]
+                            result = match_product_reference(code_part, reference_mapping)
+                            if result and result[0] is not None:
+                                matched_ref, department = result
+                                return matched_ref, department
+                        
+                        # If neither matches, return the captured reference and None for department
+                        return potential_ref, None
+                break
+        
+        # If we didn't find the structured format, try to find any line with product reference pattern
         for line in lines:
-            if "Item Description" in line:
-                item_desc_found = True
-                continue
-            if item_desc_found:
-                if (re.search(r'Item number|Quantity|U/M|Purch price|Line Amount|Price UnitLine', line, re.IGNORECASE) or 
-                    line.strip() == ""):
-                    break
-                item_desc_lines.append(line.strip())
-        
-        if len(item_desc_lines) >= 2:
-            second_line = item_desc_lines[1]
-            digit_pattern = r'[A-Z0-9]{25}'
-            digit_match = re.search(digit_pattern, second_line.upper())
-            if digit_match:
-                potential_ref = digit_match.group(0)
-                matched_ref, department = match_product_reference(potential_ref, reference_mapping)
-                if matched_ref:
+            # Look for pattern like "LBL.MAIN_LB" or similar
+            match = re.search(r'([A-Z]{3}\.[A-Z]{4,}(?:\s+\d+)?)', line)
+            if match:
+                potential_ref = match.group(1).strip()
+                result = match_product_reference(potential_ref, reference_mapping)
+                if result and result[0] is not None:
+                    matched_ref, department = result
                     return matched_ref, department
-            matched_ref, department = match_product_reference(second_line, reference_mapping)
-            if matched_ref:
-                return matched_ref, department
-
-        # Fallback: try line starting with No Item ...
-        for line in lines:
-            if re.match(r'^\d+\s+[A-Z0-9\.\-\_]+', line):
-                parts = line.split()
-                if len(parts) > 1:
-                    candidate = parts[1]
-                    matched_ref, department = match_product_reference(candidate, reference_mapping)
-                    if matched_ref:
-                        return matched_ref, department
-
+                else:
+                    return potential_ref, None
+        
+        # If still no match found, return None
         return None, None
     except Exception as e:
         st.error(f"Error extracting product reference: {e}")
@@ -250,19 +283,20 @@ def extract_product_code_and_xmill_date(pdf_file, reference_mapping):
             product_code = ""
             department = None
             
-            # Method 1
-            tag_match = re.search(r"TAG\.PRC\.TKT_(.*?)_REG", first_text)
-            if tag_match:
-                product_code = tag_match.group(1).strip().upper().replace("-", " ")
-                matched_ref, department = match_product_reference(product_code, reference_mapping)
-                if matched_ref:
-                    product_code = matched_ref
+            # Extract product reference from the structured format only
+            result = extract_product_reference_from_structured_line(first_text, reference_mapping)
+            if result and result[0] is not None:
+                product_code, department = result
+            elif result and result[0] is None:
+                # If product_code is None but result is not None, it means we have a product reference but no department
+                product_code = result[1] if result[1] else ""
             else:
-                # Method 2
-                product_code, department = extract_product_reference_from_item_description(first_text, reference_mapping)
+                # If result is None, try to extract product reference without matching
+                product_code = ""
+                department = None
 
-            # X-Mill Date fallback
-            x_mill_date = ""
+            # X-Mill Date extraction
+            x_mill_date = ""    
             date_match = re.search(r'X-Mill Date\(dd-mm-yy\)\s*[:\-]?\s*(\d{2}-\d{2}-\d{2})', first_text, re.IGNORECASE)
             if not date_match:
                 date_match = re.search(r'XMill Date\s*[:\-]?\s*(\d{2}-\d{2}-\d{2})', first_text, re.IGNORECASE)
